@@ -681,6 +681,149 @@ test("STATUS preserves retained intended-untracked selection through selectorles
 	assert.deepEqual(requests.slice(-2), Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", ...override })));
 });
 
+test("cross-session missing route rejects before STATUS even when a shared projection exists", async (t) => {
+	const views = new CandidateViewRegistry();
+	t.after(() => views.cleanupAll());
+	const cwd = repository(t), lineageId = "shared-projection";
+	const view = views.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	views.retain(view.token, lineageId);
+	const input = correctionPlanInput(lineageId), binding = JSON.stringify(input);
+	const sessionA = new Map(), sessionB = new Map();
+	let statuses = 0, captures = 0;
+	const native = {
+		targetStatus: async () => { statuses += 1; return status(lineageId, [input]); },
+		captureCorrectionPlan: async () => { captures += 1; return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA }; },
+	} as unknown as NativeReviewCli;
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, views, undefined, sessionA);
+	assert.equal(sessionA.size > 0, true);
+	sessionA.clear(); // Simulate bounded route eviction, not session issuance loss.
+	const beforeB = statuses;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const denied = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: binding, correctionLines: 1 }, cwd, native, undefined, views, sessionB, true);
+		assert.equal(denied.reason_code, "route_not_retained");
+		assert.equal(statuses, beforeB, "foreign session must not negotiate STATUS");
+	}
+	assert.equal(captures, 0);
+	// A terminal STATUS revokes even issuance that survived the route-map eviction.
+	const terminal = status(lineageId, []);
+	terminal.authority!.state = "approved";
+	const terminalNative = { targetStatus: async () => { statuses += 1; return terminal; } } as unknown as NativeReviewCli;
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, terminalNative, undefined, views, undefined, sessionA);
+	const afterTerminal = statuses;
+	const revoked = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: binding, correctionLines: 1 }, cwd, native, undefined, views, sessionA, true);
+	assert.equal(revoked.reason_code, "route_not_retained");
+	assert.equal(statuses, afterTerminal);
+});
+
+test("changed collect rejects an old issued committed binding before native STATUS", async (t) => {
+	const views = new CandidateViewRegistry();
+	t.after(() => views.cleanupAll());
+	const cwd = repository(t), lineageId = "changed-collect-route";
+	const view = views.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	views.retain(view.token, lineageId);
+	const a = correctionPlanInput(lineageId);
+	const b = correctionPlanInput(lineageId);
+	b.arguments = [...b.arguments, { name: "changed", value: "second", token: "--changed=second" }];
+	let statuses = 0, captures = 0;
+	let offered = a;
+	const native = {
+		targetStatus: async () => { statuses++; return status(lineageId, [offered]); },
+		captureCorrectionPlan: async () => { captures++; return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA }; },
+	} as unknown as NativeReviewCli;
+	const selection = new Map();
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, views, undefined, selection);
+	offered = b;
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, views, undefined, selection);
+	assert.equal(selection.size > 0, true);
+	const beforeCapture = statuses;
+	const rejected = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: JSON.stringify(a), correctionLines: 1 }, cwd, native, undefined, views, selection, true);
+	assert.equal(rejected.reason_code, "route_not_retained");
+	assert.equal(statuses, beforeCapture, "revoked issuance must reject before native STATUS");
+	assert.equal(captures, 0);
+	const accepted = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: JSON.stringify(b), correctionLines: 1 }, cwd, native, undefined, views, selection, true);
+	assert.equal(accepted.outcome, "native-last-event-closure");
+	assert.equal(captures, 1);
+});
+
+test("missing committed route recovers only exact current single and group bindings", async (t) => {
+	const views = new CandidateViewRegistry(); t.after(() => views.cleanupAll());
+	const cwd = repository(t), other = repository(t), lineageId = "recover-route";
+	const view = views.create({ contributorRoot: cwd, baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(), committedOnly: true });
+	views.retain(view.token, lineageId);
+	const baseRef = views.resolveProjection(lineageId, cwd).baseCommit;
+	const input = correctionPlanInput(lineageId), binding = JSON.stringify(input);
+	const requests: Array<Record<string, unknown>> = [];
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return status(lineageId, [input]); },
+		captureCorrectionPlan: async () => { captures += 1; return { schema: "gentle-ai.review-last-event-closure/v1", operation: "review.capture-correction-plan", lineageId, state: "correction_required", storeRevision: SHA }; },
+	} as unknown as NativeReviewCli;
+	const selection = new Map();
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, views, undefined, selection);
+	selection.clear();
+	const single = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: binding, correctionLines: 1 }, cwd, native, undefined, views, selection, true);
+	assert.equal(single.outcome, "native-last-event-closure");
+	assert.deepEqual(requests.slice(0, 2), Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", baseRef, committedOnly: true })));
+	assert.equal(captures, 1);
+	const stale = await __testing.executeReviewCaptureOperation({ lineageId, collectBinding: JSON.stringify({ ...input, arguments: [...input.arguments, { name: "stale", value: "x", token: "--stale=x" }] }), correctionLines: 1 }, cwd, native, undefined, views, new Map(), true);
+	assert.equal(stale.outcome, "capture-binding-rejected");
+	await assert.rejects(() => __testing.executeReviewCaptureOperation({ lineageId, workspaceRoot: other, collectBinding: binding }, cwd, native, undefined, views, new Map(), true));
+	const foreign = await __testing.executeReviewCaptureOperation({ lineageId: "foreign-lineage", collectBinding: binding }, cwd, native, undefined, views, new Map(), true);
+	assert.equal(foreign.reason_code, "route_not_retained");
+	assert.equal(requests.length, 2);
+});
+
+test("missing committed route recovers a materialize group but rejects a changed ordered suffix", async (t) => {
+	const views = new CandidateViewRegistry();
+	t.after(() => views.cleanupAll());
+	const cwd = repository(t);
+	const { raw } = fourLensCollectStatus();
+	const collect = (raw.next_transition as { collect: { inputs: Array<Record<string, unknown>> } }).collect;
+	const subjectHash = (collect.inputs[0]!.artifact_subject as { subject_hash: string }).subject_hash;
+	collect.inputs = collect.inputs.map((input, index) => {
+		const distinct = JSON.parse(JSON.stringify(input).replaceAll(subjectHash, `sha256:${String(index + 1).repeat(64)}`)) as Record<string, unknown>;
+		(distinct.artifact_subject as { selected_order: number }).selected_order = index;
+		const order = (distinct.arguments as Array<{ name: string; value: string }>).find((arg) => arg.name === "order");
+		if (order) order.value = String(index);
+		return distinct;
+	});
+	const collecting = decodeReviewStatusV3(raw);
+	const lineageId = collecting.authority!.lineageId!;
+	const view = views.create({
+		contributorRoot: cwd,
+		baseRef: execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8" }).trim(),
+		committedOnly: true,
+	});
+	views.retain(view.token, lineageId);
+	const baseRef = views.resolveProjection(lineageId, cwd).baseCommit;
+	const bindings = collecting.nextTransition!.kind === "collect"
+		? collecting.nextTransition.collect!.inputs.map((input) => JSON.stringify(input))
+		: [];
+	assert.equal(bindings.length, 4);
+	const requests: Array<Record<string, unknown>> = [];
+	let captures = 0;
+	const native = {
+		targetStatus: async (request: Record<string, unknown>) => { requests.push(request); return collecting; },
+		captureResult: async () => { captures += 1; throw new Error("capture must not run during forecast"); },
+	} as unknown as NativeReviewCli;
+	const selection = new Map();
+	await __testing.executeReviewControllerOperation({ operation: "status", lineageId }, cwd, native, undefined, views, undefined, selection);
+	selection.clear();
+	const forecast = await __testing.executeReviewCaptureGroupOperation(
+		{ lineageId, collectBindings: bindings }, cwd, native, undefined, views, selection, true,
+	);
+	assert.equal(forecast.outcome, "reviewer-model-run-forecast", String(forecast.reason));
+	assert.equal((forecast.cost_forecast as { model_runs: number }).model_runs, 4);
+	assert.deepEqual(requests, Array.from({ length: 2 }, () => ({ cwd, lineageId, agent: "pi", baseRef, committedOnly: true })));
+	const changed = [bindings[1]!, bindings[0]!, ...bindings.slice(2)];
+	const rejected = await __testing.executeReviewCaptureGroupOperation(
+		{ lineageId, collectBindings: changed }, cwd, native, undefined, views, selection, true,
+	);
+	assert.equal(rejected.outcome, "capture-group-rejected");
+	assert.equal(requests.length, 3);
+	assert.equal(captures, 0);
+});
+
 test("public single and group capture distinguish missing, workspace, and lineage retained routes before native STATUS", async (t) => {
 	const cwd = repository(t), otherWorkspace = repository(t);
 	const lineageId = "route-diagnostic-lineage", input = collectInput(lineageId);

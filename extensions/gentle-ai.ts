@@ -6551,6 +6551,11 @@ function isRetainedNativeCaptureRoute(selection: RetainedNativeStatusSelection |
 	return selection !== undefined && "workspaceRoot" in selection;
 }
 
+const issuedCommittedCaptureRoutes = new WeakMap<Map<string, RetainedNativeStatusSelection>, Map<string, RetainedNativeCaptureRoute>>();
+function issuedCommittedRoute(selections: Map<string, RetainedNativeStatusSelection>, binding: string): RetainedNativeCaptureRoute | undefined {
+	return issuedCommittedCaptureRoutes.get(selections)?.get(reviewCaptureSelectionStorageKey(binding));
+}
+
 function retainNativeCaptureRoutes(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, status: ReviewStatusV3, baseRef: string | undefined): void {
 	const lineageId = status.authority?.lineageId;
 	if (status.applicability !== "current_target" || !isCanonicalProcessString(lineageId) || isTerminalReviewAuthorityState(status.authority?.state)) {
@@ -6563,6 +6568,13 @@ function retainNativeCaptureRoutes(selections: Map<string, RetainedNativeStatusS
 		if (isRetainedNativeCaptureRoute(existing) && (existing.workspaceRoot !== route.workspaceRoot || existing.lineageId !== route.lineageId || existing.baseRef !== route.baseRef || existing.committedOnly !== route.committedOnly)) { recordRoute(selections, key, "collision"); throw new NativeCaptureRouteRegistrationError("Provider collectBinding collides with a different registered route"); }
 	}
 	const current = new Set(routes.map(({ key }) => key));
+	const issued = issuedCommittedCaptureRoutes.get(selections) ?? new Map<string, RetainedNativeCaptureRoute>();
+	for (const [key, route] of issued) if (route.workspaceRoot === workspaceRoot && route.lineageId === lineageId && !current.has(key)) issued.delete(key);
+	for (const { key, route } of routes) if (route.baseRef !== undefined) {
+		if (!issued.has(key) && issued.size >= MAX_RETAINED_NATIVE_STATUS_SELECTIONS) issued.delete(issued.keys().next().value!);
+		issued.set(key, route);
+	}
+	issuedCommittedCaptureRoutes.set(selections, issued);
 	for (const [key, selection] of selections) if (isRetainedNativeCaptureRoute(selection) && selection.workspaceRoot === workspaceRoot && selection.lineageId === lineageId && !current.has(key)) { selections.delete(key); recordRoute(selections, key, "removed", routes.length ? "changed_collect_set" : "no_collect_transition"); }
 	for (const { key, route } of routes) if (!selections.has(key)) { retainNativeStatusSelection(selections, key, route); recordRoute(selections, key, "registered"); }
 }
@@ -6581,6 +6593,8 @@ function clearRetainedNativeUntrackedSelection(selections: Map<string, RetainedN
 function clearRetainedNativeStatusSelectionsOnTerminal(selections: Map<string, RetainedNativeStatusSelection>, workspaceRoot: string, lineageId: string | undefined, state: string | undefined): void {
 	if (lineageId === undefined || !isTerminalReviewAuthorityState(state)) return;
 	if (state !== "approved") clearRetainedNativeUntrackedSelection(selections, workspaceRoot, lineageId);
+	const issued = issuedCommittedCaptureRoutes.get(selections);
+	if (issued) for (const [key, route] of issued) if (route.workspaceRoot === workspaceRoot && route.lineageId === lineageId) issued.delete(key);
 	for (const [key, selection] of selections) if (isRetainedNativeCaptureRoute(selection) && selection.workspaceRoot === workspaceRoot && selection.lineageId === lineageId) { selections.delete(key); recordRoute(selections, key, "removed", "terminal"); }
 }
 
@@ -7427,8 +7441,14 @@ async function executeReviewCaptureOperation(
 	}
 	const canonicalBinding = parseCanonicalReviewCaptureBinding(parameters.collectBinding);
 	const cwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
-	const route = readRetainedNativeCaptureRoute(retainedUntrackedSelections, canonicalBinding);
-	if (requireRegisteredRoute && (route === undefined || route.workspaceRoot !== cwd || route.lineageId !== parameters.lineageId)) {
+	let route = readRetainedNativeCaptureRoute(retainedUntrackedSelections, canonicalBinding);
+	const provenance = route === undefined ? issuedCommittedRoute(retainedUntrackedSelections, canonicalBinding) : undefined;
+	const frozen = provenance?.workspaceRoot === cwd && provenance.lineageId === parameters.lineageId && candidateViews?.hasProjection(parameters.lineageId, cwd) ? candidateViews.resolveProjection(parameters.lineageId, cwd) : undefined;
+	const recoveryBaseRef = frozen?.committedOnly === true && provenance?.baseRef === nativeCommittedRangeSelector(frozen) ? provenance.baseRef : undefined;
+	if (requireRegisteredRoute && (
+		(route === undefined && recoveryBaseRef === undefined) ||
+		(route !== undefined && (route.workspaceRoot !== cwd || route.lineageId !== parameters.lineageId))
+	)) {
 		return {
 			...captureBindingRejected("collectBinding is unknown, expired, or belongs to a different session route"),
 			reason_code: route === undefined ? "route_not_retained" : route.workspaceRoot !== cwd ? "route_workspace_mismatch" : "route_lineage_mismatch",
@@ -7439,12 +7459,17 @@ async function executeReviewCaptureOperation(
 		const negotiated = await negotiatedStatusForHostTransport(nativeReviewCli, {
 			cwd,
 			lineageId: parameters.lineageId,
-			...(route?.baseRef === undefined ? {} : { baseRef: route.baseRef, committedOnly: true }),
+			...((route?.baseRef ?? recoveryBaseRef) === undefined ? {} : { baseRef: route?.baseRef ?? recoveryBaseRef, committedOnly: true }),
 			...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, cwd, parameters.lineageId),
 			...(signal === undefined ? {} : { signal }),
 		}, retainedUntrackedSelections, cwd);
 		if (negotiated.transport !== undefined) return hostTransportUnavailable("gentle_review_capture", negotiated.transport);
 		status = negotiated.status!;
+		if (requireRegisteredRoute && route === undefined) {
+			route = readRetainedNativeCaptureRoute(retainedUntrackedSelections, canonicalBinding);
+			if (route?.workspaceRoot !== cwd || route.lineageId !== parameters.lineageId || route.baseRef !== recoveryBaseRef)
+				return { ...captureBindingRejected("collectBinding is not offered by current STATUS"), reason_code: "route_not_retained" };
+		}
 	} catch (error) {
 		return nativeOperationFailure("gentle_review_capture", error);
 	}
@@ -7593,8 +7618,17 @@ async function executeReviewCaptureGroupOperation(
 	const canonicalBindings = parameters.collectBindings.map((binding) => parseCanonicalReviewCaptureBinding(binding));
 	const cwd = resolveReviewControllerWorkspaceRoot(parameters.workspaceRoot, sessionCwd, candidateViews, parameters.lineageId);
 	const routes = canonicalBindings.map((binding) => readRetainedNativeCaptureRoute(retainedUntrackedSelections, binding));
-	const route = routes[0];
-	if (requireRegisteredRoute && (route === undefined || routes.some((candidate) => candidate === undefined || candidate.workspaceRoot !== cwd || candidate.lineageId !== parameters.lineageId || candidate.baseRef !== route.baseRef))) {
+	let route = routes[0];
+	const provenance = routes.every((candidate) => candidate === undefined) ? canonicalBindings.map((binding) => issuedCommittedRoute(retainedUntrackedSelections, binding)) : [];
+	const frozen = provenance.length === canonicalBindings.length && provenance.every((candidate) => candidate?.workspaceRoot === cwd && candidate.lineageId === parameters.lineageId) && candidateViews?.hasProjection(parameters.lineageId, cwd) ? candidateViews.resolveProjection(parameters.lineageId, cwd) : undefined;
+	const recoveryBaseRef = frozen?.committedOnly === true && provenance.every((candidate) => candidate?.baseRef === nativeCommittedRangeSelector(frozen)) ? nativeCommittedRangeSelector(frozen) : undefined;
+	if (requireRegisteredRoute && (
+		(route === undefined && recoveryBaseRef === undefined) ||
+		routes.some((candidate) => candidate !== undefined && (
+			candidate.workspaceRoot !== cwd || candidate.lineageId !== parameters.lineageId || candidate.baseRef !== route?.baseRef
+		)) ||
+		(route !== undefined && routes.some((candidate) => candidate === undefined))
+	)) {
 		return {
 			...captureGroupRejected("collectBindings are unknown, expired, or belong to different session routes"),
 			reason_code: routes.some((candidate) => candidate === undefined) ? "route_not_retained"
@@ -7604,7 +7638,7 @@ async function executeReviewCaptureGroupOperation(
 	}
 	const freshStatus = () => negotiatedStatusForHostTransport(nativeReviewCli, {
 		cwd, lineageId: parameters.lineageId,
-		...(route?.baseRef === undefined ? {} : { baseRef: route.baseRef, committedOnly: true }),
+		...((route?.baseRef ?? recoveryBaseRef) === undefined ? {} : { baseRef: route?.baseRef ?? recoveryBaseRef, committedOnly: true }),
 		...readRetainedNativeUntrackedSelection(retainedUntrackedSelections, cwd, parameters.lineageId),
 		...(signal === undefined ? {} : { signal }),
 	}, retainedUntrackedSelections, cwd);
@@ -7613,6 +7647,12 @@ async function executeReviewCaptureGroupOperation(
 		const negotiated = await freshStatus();
 		if (negotiated.transport !== undefined) return hostTransportUnavailable("gentle_review_capture_group", negotiated.transport);
 		status = negotiated.status!;
+		if (requireRegisteredRoute && route === undefined) {
+			const recovered = canonicalBindings.map((binding) => readRetainedNativeCaptureRoute(retainedUntrackedSelections, binding));
+			if (recovered.some((candidate) => candidate?.workspaceRoot !== cwd || candidate.lineageId !== parameters.lineageId || candidate.baseRef !== recoveryBaseRef))
+				return { ...captureGroupRejected("collectBindings are not offered by current STATUS"), reason_code: "route_not_retained" };
+			route = recovered[0];
+		}
 	} catch (error) {
 		return { ...captureGroupRejected(error instanceof Error ? error.message : String(error)), outcome: "native-status-failed" };
 	}
