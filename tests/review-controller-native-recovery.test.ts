@@ -334,11 +334,102 @@ function interactiveContext(confirm: boolean): ExtensionContext {
 
 const SHA2 = `sha256:${"b".repeat(64)}`;
 
+function abandonStatus() {
+	return {
+		schema: "gentle-ai.review-authority-status/v1", operation: "review/status",
+		repository: process.cwd(), complete: true, authoritative: true, status: "active",
+		entries: [{ version: "compact-v2", path: "/authority/compact", status: "active", problems: [], lineage_id: "stranded", revision: SHA, snapshot_identity: SHA2, discarded_work: { captured_lens_results: ["00-review-risk", "01-review-resilience"], findings_present: true } }],
+		locks: [], diagnostics: [],
+	};
+}
+
+const abandonParams = { operation: "abandon", lineageId: "stranded", input: JSON.stringify({ actor: "maintainer", reason: "operator_disposition" }) };
+const abandonAudit = { operation: "review/abandon", record: { schema: "gentle-ai.review-reclaim-audit/v1", lineage_id: "stranded", status: "committed" } };
+
+for (const read of [1, 2]) {
+	for (const defect of ["nonauthoritative", "incomplete", "duplicate-incomplete", "duplicate-ineligible", "zero", "drift", "snapshot drift", "lens drift", "findings drift", "failure"] as const) {
+		// Only the post-consent read can drift from an approved binding.
+		if (defect.endsWith(" drift") && read === 1) continue;
+		test(`registered ABANDON rejects ${defect} inventory on read ${read}`, async () => {
+			const invalid = abandonStatus();
+			if (defect === "nonauthoritative") invalid.authoritative = false;
+			if (defect === "incomplete") { invalid.complete = false; invalid.authoritative = false; }
+			if (defect === "zero") invalid.entries = [];
+			if (defect === "drift") invalid.entries[0]!.revision = read === 2 ? `sha256:${"c".repeat(64)}` : "";
+			if (defect === "snapshot drift") invalid.entries[0]!.snapshot_identity = `sha256:${"c".repeat(64)}`;
+			if (defect === "lens drift") invalid.entries[0]!.discarded_work.captured_lens_results.reverse();
+			if (defect === "findings drift") invalid.entries[0]!.discarded_work.findings_present = false;
+			if (defect.startsWith("duplicate")) invalid.entries.push({ version: defect === "duplicate-ineligible" ? "legacy-v1" : "compact-v2", path: "/authority/duplicate", status: "invalid", problems: [], lineage_id: "stranded" } as typeof invalid.entries[number]);
+			const responses = [ ...(read === 2 ? [{ stdout: JSON.stringify(abandonStatus()) }] : []), { stdout: defect === "failure" ? "invalid JSON" : JSON.stringify(invalid) }, { stdout: JSON.stringify(abandonAudit) } ];
+			const queue = queuedAdapter(responses);
+			const result = await registeredController(client(queue.adapter)).execute("invalid", abandonParams, undefined, undefined, interactiveContext(true));
+			assert.equal((result.details as Record<string, unknown>).mutation_performed, false);
+			assert.equal(queue.calls.length, read);
+		});
+	}
+}
+
+for (const phase of ["first inventory", "approval", "second inventory"] as const) {
+	test(`registered ABANDON cancellation during ${phase} prevents dispatch`, async () => {
+		const abort = new AbortController();
+		let reads = 0;
+		const adapter: ExecFileAdapter = async () => {
+			reads += 1;
+			if ((phase === "first inventory" && reads === 1) || (phase === "second inventory" && reads === 2)) abort.abort();
+			return { stdout: JSON.stringify(reads <= 2 ? abandonStatus() : abandonAudit), stderr: "", exitCode: 0, signal: null, timedOut: false, outputLimitExceeded: false };
+		};
+		const ctx = interactiveContext(true);
+		ctx.ui.confirm = async () => { if (phase === "approval") abort.abort(); return true; };
+		await assert.rejects(registeredController(client(adapter)).execute("cancel", abandonParams, abort.signal, undefined, ctx), /cancel/i);
+		assert.equal(reads, phase === "second inventory" ? 2 : 1);
+	});
+}
+
+
+test("registered ABANDON displays and dispatches the exact eight-line binding once", async () => {
+	const queue = queuedAdapter([{ stdout: JSON.stringify(abandonStatus()) }, { stdout: JSON.stringify(abandonStatus()) }, { stdout: JSON.stringify(abandonAudit) }]);
+	const ctx = interactiveContext(true);
+	const authorization = `gentle-ai.review-abandon-authorization/v2\nlineage=stranded\nrevision=${SHA}\nsnapshot_identity=${SHA2}\nreason=operator_disposition\ncaptured_lens_results=00-review-risk,01-review-resilience\nfindings_present=true\nactor=maintainer`;
+	let approvals = 0;
+	ctx.ui.confirm = async (title, message) => {
+		approvals += 1;
+		assert.equal(title, "Authorize review authority ABANDON?");
+		assert.equal(message, ["Operation: ABANDON", "Exact published authorization binding:", authorization, "The native command may quarantine only an eligible pristine compact-v2 lineage."].join("\n"));
+		return true;
+	};
+	const result = await registeredController(client(queue.adapter)).execute("approved", abandonParams, undefined, undefined, ctx);
+	assert.equal((result.details as Record<string, unknown>).mutation_outcome, "committed");
+	assert.equal(approvals, 1);
+	assert.equal(queue.calls.length, 3);
+	assert.deepEqual(queue.calls[2]!.arguments, ["review", "abandon", "--cwd", queue.calls[0]!.cwd, "--lineage", "stranded", "--expected-revision", SHA, "--actor", "maintainer", "--reason", "operator_disposition", "--maintainer-authorization", authorization]);
+});
+
+for (const scenario of ["caller facts", "conflict", "headless", "declined", "foreign repository", "dispatch failure"] as const) {
+	test(`registered ABANDON fails closed for ${scenario} without replay`, async () => {
+		const status = abandonStatus();
+		if (scenario === "foreign repository") status.repository = "/foreign/repository";
+		const queue = queuedAdapter([{ stdout: JSON.stringify(status) }, { stdout: JSON.stringify(status) }, { stdout: JSON.stringify(abandonAudit), exitCode: 1 }]);
+		const controller = registeredController(client(queue.adapter));
+		const ctx = interactiveContext(scenario !== "declined");
+		if (scenario === "headless") Object.assign(ctx, { hasUI: false });
+		const params = { ...abandonParams, input: JSON.stringify({ actor: "maintainer", reason: "operator_disposition", ...(scenario === "caller facts" ? { findingsPresent: true } : {}), ...(scenario === "conflict" ? { lineage: "different" } : {}) }) };
+		if (scenario === "headless" || scenario === "declined") {
+			await assert.rejects(controller.execute("blocked", params, undefined, undefined, ctx), scenario === "headless" ? /interactive Pi UI/ : /not explicitly authorized/);
+			assert.equal(queue.calls.length, 1);
+		} else {
+			const result = await controller.execute("blocked", params, undefined, undefined, ctx);
+			assert.notEqual((result.details as Record<string, unknown>).mutation_outcome, "committed");
+			assert.equal(queue.calls.length, scenario === "dispatch failure" ? 3 : scenario === "foreign repository" ? 1 : 0);
+		}
+	});
+}
+
 function abandonedInventoryNative(calls: Array<Record<string, unknown>>): import("../lib/native-review-cli.ts").NativeReviewCli {
 	return {
 		reviewStatus: async () => ({
 			repository: "/canonical/repository",
 			complete: true,
+			authoritative: true,
 			entries: [
 				{ version: "legacy-v1", status: "invalid", path: "/authority/legacy", problems: [] },
 				{ version: "compact-v2", status: "active", path: "/authority/compact", lineageId: "stranded", revision: SHA, snapshotIdentity: SHA2, state: "correction_required", discardedWork: { capturedLensResults: ["00-review-risk", "01-review-resilience"], findingsPresent: true } },
@@ -412,11 +503,13 @@ test("ABANDON rechecks the derived authority after approval and fails closed on 
 				? {
 					repository: "/canonical/repository",
 					complete: true,
+					authoritative: true,
 					entries: [{ version: "compact-v2", status: "active", path: "/authority/compact", lineageId: "stranded", revision: SHA, snapshotIdentity: SHA2, state: "correction_required", discardedWork: { capturedLensResults: ["00-review-risk", "01-review-resilience"], findingsPresent: true } }],
 				}
 				: {
 					repository: "/canonical/repository",
 					complete: true,
+					authoritative: true,
 					entries: [{ version: "compact-v2", status: "active", path: "/authority/compact", lineageId: "stranded", revision: `sha256:${"c".repeat(64)}`, snapshotIdentity: SHA2, state: "correction_required", discardedWork: { capturedLensResults: ["00-review-risk", "01-review-resilience"], findingsPresent: true } }],
 				};
 		},

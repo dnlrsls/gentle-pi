@@ -19,6 +19,15 @@ test("technical reference documents the narrow published native maintenance cont
 	assert.match(TECHNICAL_REFERENCE, /typed envelopes/i);
 });
 
+test("architecture binds ABANDON to authoritative inventory and the published discarded-work projection", () => {
+	const architecture = readFileSync("docs/native-authority-architecture.md", "utf8");
+	assert.match(architecture, /ordered captured lens results and findings presence/);
+	assert.doesNotMatch(architecture, /evidence-record presence/);
+	assert.match(architecture, /complete authoritative inventory at both the initial and post-consent reads/);
+	assert.match(architecture, /counts every matching lineage before eligibility checks/);
+	assert.match(architecture, /exact displayed eight-line binding is dispatched once without automatic retry/);
+});
+
 test("controller help keeps authorization, blocked outcomes, and recovery boundaries explicit", () => {
 	assert.match(CONTROLLER, /REPAIR_LEGACY_ALIAS.*freshly reads native inventory.*interactive approval/is);
 	assert.match(CONTROLLER, /unchanged_target,malformed_recovery_authorization/);

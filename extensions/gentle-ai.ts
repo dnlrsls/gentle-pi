@@ -5472,16 +5472,15 @@ async function executeNativeAbandon(
 	} catch (error) {
 		return nativeOperationFailure(operation, error);
 	}
-	const candidate = inventory.complete
-		? inventory.entries.filter((entry) =>
-			entry.version === "compact-v2"
-			&& entry.lineageId === lineage
-			&& entry.discardedWork !== undefined
-			&& isCanonicalProcessString(entry.revision)
-			&& entry.snapshotIdentity !== undefined,
-		)
-		: [];
-	if (candidate.length !== 1) {
+	if (signal?.aborted) throw reviewCancellation("Review controller ABANDON was cancelled");
+	// Select across every lineage match before testing eligibility: incomplete
+	// or legacy entries must not hide ambiguity in the authority inventory.
+	const candidate = inventory.entries.filter((entry) => entry.lineageId === lineage);
+	if (!inventory.complete || inventory.authoritative !== true || candidate.length !== 1
+		|| candidate[0]!.version !== "compact-v2"
+		|| candidate[0]!.discardedWork === undefined
+		|| !isCanonicalProcessString(candidate[0]!.revision)
+		|| candidate[0]!.snapshotIdentity === undefined) {
 		return { operation, status: "blocked", outcome: "native-abandon-ineligible", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "inspect-complete-native-authority-inventory" };
 	}
 	const entry = candidate[0]!;
@@ -5501,6 +5500,7 @@ async function executeNativeAbandon(
 		"Authorize review authority ABANDON?",
 		["Operation: ABANDON", "Exact published authorization binding:", authorization, "The native command may quarantine only an eligible pristine compact-v2 lineage."].join("\n"),
 	);
+	if (signal?.aborted) throw reviewCancellation("Review controller ABANDON was cancelled");
 	if (!approved) throw new Error("Review controller ABANDON was not explicitly authorized");
 	// The approval binds the exact derived authority. Re-read the inventory and
 	// fail closed on any drift before mutating, the way RECOVER rechecks its
@@ -5512,21 +5512,20 @@ async function executeNativeAbandon(
 	} catch (error) {
 		return nativeOperationFailure(operation, error);
 	}
-	const reconfirmed = recheck.complete
-		? recheck.entries.filter((entry) =>
-			entry.version === "compact-v2"
-			&& entry.lineageId === request.lineage
-			&& entry.discardedWork !== undefined
-			&& entry.revision === request.expectedRevision
-			&& entry.snapshotIdentity === request.snapshotIdentity
-			&& entry.discardedWork.capturedLensResults.every((lens, index) => lens === request.capturedLensResults[index])
-			&& entry.discardedWork.capturedLensResults.length === request.capturedLensResults.length
-			&& entry.discardedWork.findingsPresent === request.findingsPresent,
-		)
-		: [];
-	if (reconfirmed.length !== 1) {
+	if (signal?.aborted) throw reviewCancellation("Review controller ABANDON was cancelled");
+	const reconfirmed = recheck.entries.filter((entry) => entry.lineageId === request.lineage);
+	const fresh = reconfirmed[0];
+	if (!recheck.complete || recheck.authoritative !== true || reconfirmed.length !== 1
+		|| fresh === undefined || fresh.version !== "compact-v2"
+		|| fresh.discardedWork === undefined
+		|| fresh.revision !== request.expectedRevision
+		|| fresh.snapshotIdentity !== request.snapshotIdentity
+		|| !fresh.discardedWork.capturedLensResults.every((lens, index) => lens === request.capturedLensResults[index])
+		|| fresh.discardedWork.capturedLensResults.length !== request.capturedLensResults.length
+		|| fresh.discardedWork.findingsPresent !== request.findingsPresent) {
 		return { operation, status: "blocked", outcome: "native-abandon-authority-changed", native_operation: nativeOperation, mutation_performed: false, mutation_outcome: "none", next_action: "inspect-and-restart-abandon-from-fresh-inventory" };
 	}
+	if (signal?.aborted) throw reviewCancellation("Review controller ABANDON was cancelled");
 	try {
 		const result = await nativeReviewCli.abandon({ ...request, maintainerAuthorization: authorization, ...(signal === undefined ? {} : { signal }) });
 		return { operation, native_operation: nativeOperation, result: result.record, mutation_performed: true, mutation_outcome: "committed", next_action: "inspect" };
